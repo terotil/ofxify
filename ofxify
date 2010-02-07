@@ -1,0 +1,316 @@
+#!/usr/bin/ruby
+
+# == Synopsis
+#
+# ofxify: Convert bank statements from various formats to OFX.
+#
+# == Usage
+#
+# ofxify [OPTIONS]
+#
+# -h, --help
+#    Show help.
+# -i, --input <file>
+#    Read input from file. Default (and '-') is from STDIN.
+# -o, --output <file>
+#    Write OFX to file. Default (and '-') is to STDOUT.
+# -F, --field-separator <sep>
+#    Use sep as field separator for table.  Default is "," (comma).
+# -R, --record-separator <sep>
+#    Use sep as record separator for table.  Default is "\n" (newline).
+# -f, --format <col1,col2,col3,...>
+#    Use given column order for table.  Each colN is one of date, description, amount, id, skip.  Default is "date,description,id,amount".
+# --processor <processor>
+#    Processors available.  Default is table.
+#    table: Generic table data (see -F, -R, -f and --date-format options)
+#    sampo: Old (before Danske Bank merger) Sampopankki CSV statement.
+#    samlink: Samlink (Aktia, POP, Handelsbanken) HTML statement (in finnish).
+# --date-format <formatstring>
+#    Date column formatstring for table.  Default is "%F %T" (e.g. "2010-02-07 13:54:52").
+# --bank-id <id>
+#    Bank id. Default is 0.
+# --account-id <id>
+#    Account id.  Default is 0.
+# --input-encoding <encoding>
+#    Character encoding for csv data.  Default is ISO-8859-1.
+#
+# == Examples
+#
+# ofxify -f ,date,description,,,amount
+#   Reads CSV from STDIN and writes OFX to STDOUT.  Second column is date (format YYYY-MM-DD hh:mm:ss), third description and 6th amount (columns 1, 4 and 5 are skipped).
+
+require 'rubygems'
+require 'builder'
+require 'csv'
+require 'getoptlong'
+require 'rdoc/usage'
+require 'date'
+require 'iconv'
+require 'md5'
+
+class String
+  def ascii_translit
+    @@ascii_translit ||= Iconv.new('US-ASCII//TRANSLIT', $input_encoding)
+  end
+
+  def to_ascii
+    ascii_translit.iconv(self)
+  end
+end
+
+$main = self
+
+options = 
+  GetoptLong.new(
+                 ['--help', '-h', GetoptLong::NO_ARGUMENT],
+                 ['--input', '-i', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--input-encoding', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--output', '-o', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--field-separator', '-F', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--record-separator', '-R', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--format', '-f', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--processor', '-p', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--date-format', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--bank-id', GetoptLong::REQUIRED_ARGUMENT],
+                 ['--account-id', GetoptLong::REQUIRED_ARGUMENT]
+                 )
+
+def self.md5sum(str)
+  @md5 ||= MD5.new
+  @md5.update(str)
+  @md5.hexdigest
+end
+
+def self.parse_format_option(format_option)
+  format_option.split(',').map do |field|
+    case field
+    when ""
+      :skip
+    when "date", "description", "amount", "id"
+      field.to_sym
+    else
+      raise 'Unknown --format field %s.'%field.inspect
+    end
+  end
+end
+
+$input_encoding = "ISO-8859-1"
+output_encoding = "ASCII"
+#output_encoding = "ISO-8859-1"
+#output_encoding = "UTF-8"
+ofx_datetime_format = "%Y%m%d%H%M%S"
+input = STDIN
+output = STDOUT
+field_separator = nil
+record_separator = nil
+csv_format = :generic
+col_format = parse_format_option("date,description,id,amount")
+processor = :table
+@date_format = "%F %T"
+bank_id = 0
+account_id = 0
+
+options.each do |option, argument|
+  case option
+  when '--help'
+    RDoc::usage
+  when '--input'
+    if argument == '-' or not File.exist?(argument)
+      raise 'Error: Input file %s not found.'%argument.inspect
+    end
+    input = File.open(argument, 'r') unless argument == '-'
+  when '--input-encoding'
+    $input_encoding = argument
+  when '--output'
+    if File.exist?(argument)
+      raise 'Error: Output file %s already exists.'%argument.inspect 
+    end
+    output = File.open(argument, 'w') unless argument == '-'
+  when '--field-separator'
+    field_separator = argument
+  when '--record-separator'
+    record_separator = argument
+  when '--format'
+    col_format = parse_format_option(argument)
+  when '--processor'
+    processor = argument.to_sym
+  when '--date-format'
+    @date_format = argument
+  when '--bank-id'
+    bank_id = argument
+  when '--account-id'
+    account_id = argument
+  end
+end
+
+def self.process_sampo(input)
+  transactions = Array.new
+  col_format = parse_format_option("date,description,id,amount")
+  CSV::Reader.parse(input, ';', "\n") do |record|
+    transaction = Hash.new
+    field_index = 0
+    begin
+      record.each do |field|
+        case col_format[field_index]
+        when :skip, nil
+        when :date
+          transaction[:date] = DateTime.strptime(field, "%d.%m.%Y")
+        when :description, :id
+          transaction[col_format[field_index]] = field.to_ascii
+        when :amount
+          transaction[:amount] = field.gsub(/\s+/, '')
+        end
+        field_index += 1
+      end
+    rescue
+      next
+    end
+    transactions << transaction
+  end
+  transactions
+end
+
+@entities = {
+  :Auml => 'A',
+  :auml => 'a',
+  :Aring => 'A',
+  :aring => 'a',
+  :Ouml => 'O',
+  :ouml => 'o',
+  :amp => '&'
+}
+
+def self.process_samlink(input)
+  year = Time.now.year.to_s
+  transactions = Array.new
+  input.readlines.each do |line|
+    if line =~ /^<TD CLASS="courier1">/
+      line.gsub! '&nbsp;', ' '
+      line.gsub!(/&([a-zA-Z]+);/) { @entities[$1.to_sym] }
+      line.sub! '<TD CLASS="courier1">', ''
+      line.sub! '</TD>', ''
+      line.strip!
+      if line[70..74] == 'SALDO'
+        # this is the place we get the year reliably
+        year = line[82..85]
+      elsif line =~ /^[0-9]{4} [0-9]{4} /
+        day = line[0..1]
+        mon = line[2..3]
+        date = DateTime.strptime("#{year}-#{mon}-#{day}", "%F")
+        desc = line[10..48].strip
+        amount = (line[105..105] + line[90..103].gsub(/\s+/,'')).to_f
+        transactions << { 
+          :date => date,
+          :description => desc,
+          :amount => amount
+        }
+        update_bounds(date)
+      else
+      end
+    end
+  end
+  transactions
+end
+
+def self.parse_table(record, col_format)
+  transaction = Hash.new
+  field_index = 0
+  record.each do |field|
+    case col_format[field_index]
+    when :skip, nil
+    when :date
+      begin
+        transaction[:date] = DateTime.strptime(field, @date_format)
+      rescue
+        transaction[:date] = nil
+      end
+    when :description, :id
+      transaction[col_format[field_index]] = field.to_ascii
+    when :amount
+      transaction[:amount] = field.gsub(/\s+/, '')
+    end
+    field_index += 1
+  end
+  transaction.values.delete_if {|v| v.nil?}.empty? ? nil : transaction
+end
+
+def self.parse_record_to_transaction(record, col_format)
+  transaction = parse_table(record, col_format)
+  update_bounds(transaction[:date])
+  transaction
+end
+
+@first_transaction_date = nil
+@last_transaction_date = nil
+
+def self.update_bounds(date)
+  @first_transaction_date ||= date
+  @last_transaction_date  ||= date
+  @first_transaction_date   = [@first_transaction_date, date].min
+  @last_transaction_date    = [@last_transaction_date, date].max
+end
+
+transactions = Array.new
+if processor != :table
+  raise ArgumentError, "Invalid processor #{processor.inspect}." unless processor.is_a? Symbol
+  processor_method = "process_#{processor.to_s}".to_sym
+  if $main.respond_to? processor_method
+    transactions = $main.__send__(processor_method, input)
+  else
+    raise "Undefined processor #{processor.inspect}."
+  end
+else
+  CSV::Reader.parse(input, field_separator, record_separator) do |record|
+    transaction = $main.parse_record_to_transaction(record, csv_format, col_format)
+    transactions.push transaction unless transaction.nil?
+  end
+end
+
+raise "No transactions found!" if transactions.empty?
+
+xml = Builder::XmlMarkup.new(:target => output, :indent => 2)
+xml.instruct! :xml, :version => '1.0', :encoding => output_encoding
+xml.instruct! :ofx, :ofxheader=>200, :version=>200, :security=>'none', :oldfileuid=>'none', :newfileuid=>'none'
+xml.ofx do
+  xml.signonmsgsrsv1 do
+    xml.sonrs do
+      xml.status do
+        xml.code 0
+        xml.severity 'INFO'
+      end
+      xml.dtserver Time.now.strftime(ofx_datetime_format)
+      xml.language 'ENG'
+    end
+  end
+  xml.bankmsgsrsv1 do
+    xml.stmttrnrs do
+      xml.trnuid 0
+      xml.status do
+        xml.code 0
+        xml.severity 'INFO'
+      end
+      xml.stmtrs do
+        xml.curdef 'EUR'
+        xml.bankacctfrom do
+          xml.bankid bank_id
+          xml.acctid account_id
+          xml.accttype 'CHECKING'
+        end
+        xml.comment! 'list of transactions'
+        xml.banktranlist do
+          xml.dtstart @first_transaction_date.strftime(ofx_datetime_format)
+          xml.dtend @last_transaction_date.strftime(ofx_datetime_format)
+          transactions.each do |t|
+            xml.stmttrn do
+              xml.trntype 'POS'
+              xml.dtposted t[:date].strftime(ofx_datetime_format)
+              xml.trnamt t[:amount]
+              xml.fitid(t[:id] || 'generated_guid_'+md5sum(t.inspect))
+              xml.name t[:description]
+            end
+          end
+        end
+      end
+    end
+  end
+end

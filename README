@@ -1,0 +1,12 @@
+= ofxifier
+
+Convert bank statements from various formats to Open Financial
+Exchange (OFX) format.  Rough around the edges, but works.
+
+Supported formats
+* Generic CSV
+* HTML statement from Samlink online banking service.  Used by
+  Säästöpankki (The Finnish Savings Banks Group), Aktia,
+  Paikallisosuuspankit (The Finnish Local Cooperative Bank Group) and
+  Handelsbanken (in Finland).
+* Old (before Danske Bank merger) Sampopankki CSV statement.
